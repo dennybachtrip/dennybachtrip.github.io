@@ -81,6 +81,16 @@
   table.results th, table.results td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); }
   table.results th.n, table.results td.n { text-align: center; width: 48px; }
   table.results td.rank { color: var(--muted); width: 28px; }
+  .savebar { position: fixed; left: 0; right: 0; bottom: 0; background: var(--card);
+             border-top: 1px solid var(--line); padding: 10px 16px calc(10px + env(safe-area-inset-bottom)); z-index: 5; }
+  .savebar .inner { max-width: 720px; margin: 0 auto; display: flex; flex-direction: column; gap: 4px; }
+  .savebtn { width: 100%; background: var(--accent); color: #fff; border: 0; border-radius: 12px;
+             padding: 14px; font-weight: 700; font-size: 17px; min-height: 52px; }
+  .savebtn:disabled { background: var(--line); color: var(--muted); cursor: default; }
+  .savemsg { text-align: center; font-size: 14px; color: var(--muted); min-height: 1.2em; }
+  .savemsg.ok { color: var(--in); font-weight: 600; }
+  .vbtn.pending { outline: 3px dashed var(--accent); outline-offset: 2px; }
+  main { padding-bottom: 140px; }
 </style>
 </head>
 <body>
@@ -111,9 +121,16 @@
   </div>
 </main>
 
+<div class="savebar" id="saveBar">
+  <div class="inner">
+    <button class="savebtn" id="saveBtn" type="button" disabled>All votes saved</button>
+    <div class="savemsg" id="saveMsg"></div>
+  </div>
+</div>
+
 <dialog id="nameDialog">
-  <h2 style="margin-top:0">Who are you?</h2>
-  <p class="sub">Tap your name. You can switch any time.</p>
+  <h2 style="margin-top:0">Who's voting?</h2>
+  <p class="sub">Tap your own name so your votes count for you.</p>
   <div class="names-grid" id="nameGrid"></div>
 </dialog>
 
@@ -128,6 +145,9 @@ const $ = (id) => document.getElementById(id);
 let activities = [];
 let events = [];   // every vote ever cast, oldest first
 let me = localStorage.getItem("caboVoter") || "";
+let nameConfirmed = false; // must pick a name on every visit
+let pending = {};          // activity_id -> choice, not yet saved
+let saving = false;
 
 // ---- storage: Supabase when configured, otherwise this phone only (preview) ----
 async function loadEvents() {
@@ -162,6 +182,12 @@ function currentVotes() {
   return byActivity;
 }
 
+function savedChoice(votes, id) {
+  const m = (votes[id] || []).find((v) => v.voter.toLowerCase() === me.toLowerCase());
+  return m ? m.choice : undefined;
+}
+function myChoice(votes, id) { return id in pending ? pending[id] : savedChoice(votes, id); }
+
 function el(tag, attrs = {}, ...kids) {
   const n = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
@@ -173,7 +199,8 @@ function el(tag, attrs = {}, ...kids) {
 }
 
 function render() {
-  $("who").textContent = me ? `Voting as ${me}` : "Not signed in";
+  $("who").textContent = me && nameConfirmed ? `Voting as ${me}` : "Pick your name";
+  updateSaveBar();
   $("banner").replaceChildren();
   if (!LIVE) $("banner").append(el("div", { class: "banner" },
     "Preview mode: votes are saved on this phone only until the shared voting database is connected."));
@@ -194,7 +221,6 @@ function render() {
   for (const [i, a] of activities.entries()) {
     if (a.type === "question") { list.append(questionCard(a, votes, i + 1)); continue; }
     const cur = votes[a.id] || [];
-    const mine = cur.find((v) => v.voter.toLowerCase() === me.toLowerCase());
     const counts = { in: 0, pass: 0 };
     cur.forEach((v) => { if (v.choice in counts) counts[v.choice]++; });
 
@@ -206,8 +232,9 @@ function render() {
 
     const maps = "https://www.google.com/maps/search/?api=1&query=" + encodeURIComponent(a.address);
     const route = "https://www.google.com/maps/dir/?api=1&origin=" + encodeURIComponent("Los Cabos International Airport (SJD)") + "&destination=" + encodeURIComponent(a.address);
+    const pick = myChoice(votes, a.id);
     const buttons = el("div", { class: "votes" }, ...Object.entries(CHOICES).map(([c, label]) =>
-      el("button", { class: "vbtn" + (mine && mine.choice === c ? " on" : ""), "data-c": c,
+      el("button", { class: "vbtn" + (pick === c ? " on" : "") + (pick === c && a.id in pending ? " pending" : ""), "data-c": c,
                      onclick: () => vote(a.id, c) }, label)));
 
     const names = Object.keys(CHOICES).map((c) => {
@@ -230,9 +257,10 @@ function render() {
 
 function questionCard(q, votes, num) {
   const picks = q.options.map((o) => ({ o, who: (votes[`${q.id}:${o.id}`] || []).filter((v) => v.choice === "in").map((v) => v.voter) }));
-  const mine = picks.find((p) => p.who.some((w) => w.toLowerCase() === me.toLowerCase()));
+  const mine = picks.find((p) => myChoice(votes, `${q.id}:${p.o.id}`) === "in");
+  const isPending = q.options.some((o) => `${q.id}:${o.id}` in pending);
   const buttons = el("div", { class: "votes three" }, ...picks.map((p) =>
-    el("button", { class: "vbtn" + (mine && mine.o.id === p.o.id ? " on" : ""), "data-c": "in",
+    el("button", { class: "vbtn" + (mine && mine.o.id === p.o.id ? " on" + (isPending ? " pending" : "") : ""), "data-c": "in",
                    onclick: () => answer(q, p.o.id) }, p.o.label)));
   const names = picks.filter((p) => p.who.length).map((p) => el("p", { class: "names" }, `${p.o.label}: ${p.who.join(", ")}`));
   return el("section", { class: "card" },
@@ -243,39 +271,61 @@ function questionCard(q, votes, num) {
     names.length ? el("details", {}, el("summary", {}, "Who voted"), ...names) : "");
 }
 
-async function answer(q, optionId) {
-  if (!me) return askName();
+function stage(id, choice) {
+  const votes = currentVotes();
+  if (savedChoice(votes, id) === choice) delete pending[id]; else pending[id] = choice;
+}
+function answer(q, optionId) {
+  if (!me || !nameConfirmed) return askName();
+  // One entry per option: "in" for the pick, "pass" for the others, so the latest answer always wins.
+  for (const o of q.options) stage(`${q.id}:${o.id}`, o.id === optionId ? "in" : "pass");
+  $("saveMsg").textContent = ""; $("saveMsg").className = "savemsg";
+  render();
+}
+function vote(activityId, choice) {
+  if (!me || !nameConfirmed) return askName();
+  stage(activityId, choice);
+  $("saveMsg").textContent = ""; $("saveMsg").className = "savemsg";
+  render();
+}
+async function save() {
+  if (saving || !Object.keys(pending).length) return;
+  saving = true; updateSaveBar();
   try {
-    // One event per option: "in" for the pick, "pass" for the others, so the latest answer always wins.
-    for (const o of q.options) {
-      await saveEvent({ voter: me, activity_id: `${q.id}:${o.id}`, choice: o.id === optionId ? "in" : "pass", created_at: new Date().toISOString() });
+    for (const [id, choice] of Object.entries(pending)) {
+      await saveEvent({ voter: me, activity_id: id, choice, created_at: new Date().toISOString() });
+      delete pending[id];
     }
     events = await loadEvents();
-    render();
+    const t = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    $("saveMsg").textContent = `Saved as ${me} at ${t} ✓`; $("saveMsg").className = "savemsg ok";
   } catch (e) {
-    alert("Couldn't save that answer. Check your connection and try again.");
+    $("saveMsg").textContent = "Couldn't save. Check your connection and tap Save again."; $("saveMsg").className = "savemsg";
   }
+  saving = false;
+  render();
 }
-
-async function vote(activityId, choice) {
-  if (!me) return askName();
-  try {
-    await saveEvent({ voter: me, activity_id: activityId, choice, created_at: new Date().toISOString() });
-    events = await loadEvents();
-    render();
-  } catch (e) {
-    alert("Couldn't save that vote. Check your connection and try again.");
-  }
+function updateSaveBar() {
+  const n = new Set(Object.keys(pending).map((k) => k.split(":")[0])).size;
+  const b = $("saveBtn");
+  b.disabled = saving || n === 0;
+  b.textContent = saving ? "Saving…" : n ? `Save my votes (${n} change${n === 1 ? "" : "s"})` : "All votes saved";
 }
+$("saveBtn").addEventListener("click", save);
+window.addEventListener("beforeunload", (e) => { if (Object.keys(pending).length) { e.preventDefault(); e.returnValue = ""; } });
 
 function askName() {
   $("nameGrid").replaceChildren(...(CFG.voters || []).map((n) =>
     el("button", { type: "button", class: n === me ? "on" : "", onclick: () => {
-      me = n; localStorage.setItem("caboVoter", me); $("nameDialog").close(); render();
+      if (n !== me && Object.keys(pending).length &&
+          !confirm(`You have unsaved votes as ${me}. Switch to ${n} and discard them?`)) return;
+      if (n !== me) pending = {};
+      me = n; nameConfirmed = true; localStorage.setItem("caboVoter", me); $("nameDialog").close(); render();
     } }, n)));
   $("nameDialog").showModal();
 }
 $("switch").addEventListener("click", askName);
+$("nameDialog").addEventListener("cancel", (e) => { if (!nameConfirmed) e.preventDefault(); });
 function showTab(board) {
   $("votePane").hidden = board; $("boardPane").hidden = !board;
   $("tabVote").classList.toggle("on", !board); $("tabBoard").classList.toggle("on", board);
@@ -297,7 +347,7 @@ $("tabBoard").addEventListener("click", () => showTab(true));
   }
   if (me && CFG.voters && !CFG.voters.includes(me)) me = "";
   render();
-  if (!me) askName();
+  askName();
   if (LIVE) setInterval(async () => { try {
     const fresh = await loadEvents();
     if (fresh.length !== events.length) { events = fresh; render(); }
